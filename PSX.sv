@@ -467,11 +467,29 @@ assign sd_wr[1] = 0;
 wire [35:0] EXT_BUS;
 wire        heartbeat;
 
+wire        subq_set;
+wire [23:0] subq_set_tag;
+wire  [7:0] subq_set_status;
+wire [95:0] subq_set_data;
+wire  [7:0] subq_req_phys_seq;
+wire [23:0] subq_req_phys_tag;
+wire  [7:0] subq_req_getq_seq;
+wire [15:0] subq_req_getq;
+
 hps_ext hps_ext
 (
 	.clk_sys(clk_1x),
 	.EXT_BUS(EXT_BUS),
-	.heartbeat(heartbeat)
+	.heartbeat(heartbeat),
+
+	.subq_set(subq_set),
+	.subq_set_tag(subq_set_tag),
+	.subq_set_status(subq_set_status),
+	.subq_set_data(subq_set_data),
+	.subq_req_phys_seq(subq_req_phys_seq),
+	.subq_req_phys_tag(subq_req_phys_tag),
+	.subq_req_getq_seq(subq_req_getq_seq),
+	.subq_req_getq(subq_req_getq)
 );
 
 
@@ -1000,6 +1018,14 @@ psx
    .trackinfo_addr  (ramdownload_wraddr[10:2]),
    .trackinfo_write (ramdownload_wr && cdinfo_download),
    .resetFromCD     (resetFromCD),
+   .subq_set          (subq_set),
+   .subq_set_tag      (subq_set_tag),
+   .subq_set_status   (subq_set_status),
+   .subq_set_data     (subq_set_data),
+   .subq_req_phys_seq (subq_req_phys_seq),
+   .subq_req_phys_tag (subq_req_phys_tag),
+   .subq_req_getq_seq (subq_req_getq_seq),
+   .subq_req_getq     (subq_req_getq),
    .cd_hps_req      (sd_rd[1]),
    .cd_hps_lba      (sd_lba1),
    .cd_hps_ack      (sd_ack[1]),

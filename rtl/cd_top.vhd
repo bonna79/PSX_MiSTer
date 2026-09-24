@@ -6,6 +6,11 @@ use STD.textio.all;
 library mem;
 
 entity cd_top is
+   generic
+   (
+      GETQ_SEARCH_TIME     : integer := 3386880;   -- GetQ: minimum lead-in access time (~100ms), todo: measure on real hardware
+      GETQ_TIMEOUT         : integer := 203212800  -- GetQ: adr/point not found -> timeout after ~6 seconds (psx-spx)
+   );
    port 
    (
       clk1x                : in  std_logic;
@@ -58,6 +63,17 @@ entity cd_top is
       trackinfo_addr       : in  std_logic_vector(8 downto 0);
       trackinfo_write      : in  std_logic;
       resetFromCD          : out std_logic := '0';
+
+      -- real Subchannel Q from HPS (physical disc / subcode images), see doc/real_subq.md
+      -- only used when HPS sets bit 19 of trackinfo word 3 (subqExt), otherwise upstream behavior
+      subq_set             : in  std_logic;                     -- 1 clock pulse: new Q delivered
+      subq_set_tag         : in  std_logic_vector(23 downto 0); -- absolute frame (MSF incl. 150) or adr & point for GetQ
+      subq_set_status      : in  std_logic_vector(7 downto 0);  -- 0: present, 1: crc ok, 2: lead-in (GetQ reply), 3: not found
+      subq_set_data        : in  std_logic_vector(95 downto 0); -- Q bytes 0..11, byte 0 in bits 7..0
+      subq_req_phys_seq    : out std_logic_vector(7 downto 0) := (others => '0'); -- increments on new request
+      subq_req_phys_tag    : out std_logic_vector(23 downto 0) := (others => '0');
+      subq_req_getq_seq    : out std_logic_vector(7 downto 0) := (others => '0');
+      subq_req_getq        : out std_logic_vector(15 downto 0) := (others => '0'); -- adr & point
          
       SS_reset             : in  std_logic;
       SS_DataWrite         : in  std_logic_vector(31 downto 0);
@@ -274,6 +290,8 @@ architecture arch of cd_top is
       PHYSICALUPDATE_CALC1,
       PHYSICALUPDATE_CALC2,
       PHYSICALUPDATE_CALCDONE,
+      PHYSICALUPDATE_QLOOKUP,
+      PHYSICALUPDATE_QCHECK,
       PHYSICALUPDATE_READSUBCHANNEL
    );
    signal physicalUpdateState : tphysicalUpdateState := PHYSICALUPDATE_IDLE;
@@ -445,6 +463,52 @@ architecture arch of cd_top is
    
    signal isAudioCD                 : std_logic := '0';
    signal libcryptKey               : std_logic_vector(15 downto 0);
+
+   -- real Subchannel Q (subqExt mode)
+   constant SUBQ_ST_PRESENT         : integer := 0;
+   constant SUBQ_ST_CRCOK           : integer := 1;
+   constant SUBQ_ST_LEADIN          : integer := 2;
+   constant SUBQ_ST_NOTFOUND        : integer := 3;
+
+   signal subqExt                   : std_logic := '0';
+
+   -- sector path: Q for the sector currently fetched from HPS
+   signal subqWait                  : std_logic := '0';
+   signal subqWaitTag               : unsigned(23 downto 0) := (others => '0');
+   signal subqLastTag               : unsigned(23 downto 0) := (others => '1');
+   signal subqLastStatus            : std_logic_vector(7 downto 0) := (others => '0');
+   signal subqLastData              : std_logic_vector(95 downto 0) := (others => '0');
+   signal libcryptHit               : std_logic;
+
+   -- Q cache for the physical position path (GetLocP while idle), 64 entries, indexed by tag(5 downto 0)
+   type tsubqCacheData is array(0 to 63) of std_logic_vector(95 downto 0);
+   type tsubqCacheTag  is array(0 to 63) of std_logic_vector(29 downto 0); -- epoch(2..0) & valid & usable & present & tag(23..0)
+   signal subqCacheData             : tsubqCacheData;
+   signal subqCacheTag              : tsubqCacheTag := (others => (others => '0'));
+   signal subqCache_wrAddr          : integer range 0 to 63 := 0;
+   signal subqCache_wrData          : std_logic_vector(95 downto 0) := (others => '0');
+   signal subqCache_wrTag           : std_logic_vector(29 downto 0) := (others => '0');
+   signal subqCacheEpoch            : unsigned(2 downto 0) := (others => '0'); -- incremented on disc change, invalidates all entries
+   signal subqCache_wren            : std_logic := '0';
+   signal subqCache_rdAddr          : integer range 0 to 63 := 0;
+   signal subqCache_rdData          : std_logic_vector(95 downto 0);
+   signal subqCache_rdTag           : std_logic_vector(29 downto 0);
+   signal subqReqPhysSeq            : unsigned(7 downto 0) := (others => '0');
+
+   -- GetQ (command 1Dh)
+   signal getQReadStep              : integer range 0 to 3 := 0;
+   signal getQAdr                   : std_logic_vector(7 downto 0) := (others => '0');
+   signal getQState                 : std_logic_vector(1 downto 0) := "00"; -- 00: idle, 01: waiting, 10: found, 11: not found
+   signal getQData                  : std_logic_vector(79 downto 0) := (others => '0');
+   signal getQTimer                 : integer range 0 to 268435455 := 0;
+   signal getQAck                   : std_logic := '0';
+   signal subqReqGetqSeq            : unsigned(7 downto 0) := (others => '0');
+   signal getQPoint                 : std_logic_vector(15 downto 0) := (others => '0'); -- adr & point of the pending request
+   signal getQReplyToggle           : std_logic := '0'; -- toggles on every lead-in reply (latched outside of ce gating)
+   signal getQReplySeen             : std_logic := '0';
+   signal getQReplyTag              : std_logic_vector(15 downto 0) := (others => '0');
+   signal getQReplyStatus           : std_logic_vector(7 downto 0) := (others => '0');
+   signal getQReplyData             : std_logic_vector(79 downto 0) := (others => '0');
       
    type ttrackSearchState is
 	(
@@ -769,6 +833,12 @@ begin
                   irqOut <= '1';
                end if;
             end if;
+            if (getQAck = '1') then -- GetQ second response: INT2
+               CDROM_IRQFLAG <= "00010";
+               if (CDROM_IRQENA(1) = '1') then
+                  irqOut <= '1';
+               end if;
+            end if;
             if (getIDAck = '1' and (hasCD = '1' and isAudioCD = '0')) then -- no async here, working will halt in case irq is still pending
                CDROM_IRQFLAG <= "00010";
                if (CDROM_IRQENA(1) = '1') then
@@ -868,6 +938,8 @@ begin
             working                 <= ss_in(18)(2); -- '0'
             workDelay               <= to_integer(unsigned(ss_in(0)(31 downto 0))); -- 0
             workCommand             <= ss_in(14)(15 downto 8);
+            getQState               <= "00";
+            getQReadStep            <= 0;
                
             muted                   <= ss_in(18)(7); -- '0'
             
@@ -892,6 +964,7 @@ begin
             cmdIRQ                  <= '0';
             driveAck                <= '0';
             getIDAck                <= '0';
+            getQAck                 <= '0';
             softReset               <= '0';
             seekOnDiskCmd           <= '0';
             stop_afterseek          <= '0';
@@ -940,6 +1013,7 @@ begin
                   end if;
                   
                   working <= '0'; -- second response from reset will interfere with command (e.g. wipeout xl)
+                  getQState <= "00";
                
                   cmdPending <= '1';
                   cmd_busy   <= '1';
@@ -992,7 +1066,7 @@ begin
                      FifoResponse_reset <= '1';
                   end if;
                   
-                  if (nextCmd /= x"02" and nextCmd /= x"0D") then
+                  if (nextCmd /= x"02" and nextCmd /= x"0D" and not (nextCmd = x"1D" and subqExt = '1')) then -- GetQ reads its parameters below
                      FifoParam_reset <= '1';
                   end if;
                   
@@ -1349,9 +1423,23 @@ begin
                         
                      when x"1D" => -- GetQ
                         cmdPending <= '0';
-                        errorResponseCmd_new    <= '1';
-                        errorResponseCmd_error  <= x"01";
-                        errorResponseCmd_reason <= x"40";
+                        if (subqExt = '0') then -- no lead-in data available from HPS: behave as upstream
+                           errorResponseCmd_new    <= '1';
+                           errorResponseCmd_error  <= x"01";
+                           errorResponseCmd_reason <= x"40";
+                        elsif (hasCD = '0' or internalStatus(1) = '0') then -- error if disc is spun down
+                           errorResponseCmd_new    <= '1';
+                           errorResponseCmd_error  <= x"01";
+                           errorResponseCmd_reason <= x"80";
+                        else
+                           getQReadStep <= 3;
+                           cmdAck       <= '1';
+                           working      <= '1';
+                           workDelay    <= GETQ_SEARCH_TIME;
+                           workCommand  <= nextCmd;
+                           getQState    <= "01";
+                           getQTimer    <= GETQ_TIMEOUT;
+                        end if;
                         
                      when x"1E" => -- ReadTOC
                         cmdPending <= '0';
@@ -1413,6 +1501,16 @@ begin
                         if (workDelay = 2) then FifoResponse_Wr <= '1'; FifoResponse_Din <= std_logic_vector(to_unsigned(natural(character'pos('E')), 8)); end if; 
                      end if;
                   end if;
+                  if (workCommand = x"1D") then -- GetQ: 10 bytes raw lead-in SubQ + peak_lo
+                     if (getQState /= "10" and getQTimer > 0) then getQTimer <= getQTimer - 1; end if;
+                     if (workDelay = 13) then FifoResponse_reset <= '1'; end if;
+                     if (getQState = "10") then
+                        for i in 0 to 9 loop
+                           if (workDelay = 12 - i) then FifoResponse_Wr <= '1'; FifoResponse_Din <= getQData(i * 8 + 7 downto i * 8); end if;
+                        end loop;
+                        if (workDelay = 2) then FifoResponse_Wr <= '1'; FifoResponse_Din <= x"00"; end if; -- peak_lo, silence in lead-in
+                     end if;
+                  end if;
                else
                   working <= '0';
                   if (workCommand = x"1A") then -- GetID
@@ -1420,6 +1518,17 @@ begin
                         startMotorCMD <= '1';
                      end if;
                      getIDAck <= '1';
+                  elsif (workCommand = x"1D") then -- GetQ
+                     getQState <= "00";
+                     if (getQState = "10") then
+                        getQAck <= '1';
+                     else
+                        -- adr/point not found: timeout after ~6s -> INT5
+                        -- todo: real drive then sends a 2nd INT5 and starts playing track 1 (psx-spx), not emulated
+                        errorResponseCmd_new    <= '1';
+                        errorResponseCmd_error  <= x"04";
+                        errorResponseCmd_reason <= x"04";
+                     end if;
                   else
                      driveAck <= '1';
                   end if;
@@ -1429,7 +1538,38 @@ begin
             end if;
             
             -- don't end work command if last command isn't processed
-            if (workDelay = 11 and CDROM_IRQFLAG /= "00000") then workDelay <= 11; end if; 
+            if (workDelay = 11 and CDROM_IRQFLAG /= "00000" and workCommand /= x"1D") then workDelay <= 11; end if;
+            -- GetQ: wait for the lead-in reply from HPS (or the ~6s timeout) and for pending IRQs before responding
+            if (working = '1' and workCommand = x"1D" and workDelay = 14 and 
+                ((getQState /= "10" and getQTimer > 0) or CDROM_IRQFLAG /= "00000")) then
+               workDelay <= 14;
+            end if;
+            
+            -- GetQ reply from HPS
+            getQReplySeen <= getQReplyToggle;
+            if (getQReplySeen /= getQReplyToggle and getQState = "01" and getQReplyTag = getQPoint) then
+               if (getQReplyStatus(SUBQ_ST_NOTFOUND) = '1' or getQReplyStatus(SUBQ_ST_PRESENT) = '0') then
+                  getQState <= "11";
+               else
+                  getQState <= "10";
+                  getQData  <= getQReplyData;
+               end if;
+            end if;
+            
+            -- GetQ parameters: adr, point
+            if (getQReadStep > 0) then
+               getQReadStep <= getQReadStep - 1;
+               case (getQReadStep) is
+                  when 3 => 
+                     getQAdr      <= FifoParam_Dout;
+                     FifoParam_Rd <= '1';
+                  when 1 => 
+                     getQPoint       <= getQAdr & FifoParam_Dout;
+                     subqReqGetqSeq  <= subqReqGetqSeq + 1;
+                     FifoParam_reset <= '1';
+                  when others => null;
+               end case;
+            end if; 
             
             if (seekOnDiskCmd = '1' or seekOnDiskDrive = '1') then
                setLocActive <= '0';
@@ -2356,10 +2496,37 @@ begin
                   physicalLBANew := phy_base + phy_newOffset;
                   physicalLBA    <= physicalLBANew; 
                   if (physicalLBA /= physicalLBANew) then
-                     physicalUpdateState     <= PHYSICALUPDATE_READSUBCHANNEL;
-                     triggerUpdateSubchannel <= '1';
+                     if (subqExt = '1') then
+                        -- real Q: look for the Q of this frame in the cache filled by recent sector reads
+                        physicalUpdateState     <= PHYSICALUPDATE_QLOOKUP;
+                        subqCache_rdAddr        <= physicalLBANew mod 64;
+                     else
+                        physicalUpdateState     <= PHYSICALUPDATE_READSUBCHANNEL;
+                        triggerUpdateSubchannel <= '1';
+                     end if;
                   else
                      physicalUpdateState     <= PHYSICALUPDATE_IDLE;
+                  end if;
+                  
+               when PHYSICALUPDATE_QLOOKUP => -- RAM read latency
+                  physicalUpdateState <= PHYSICALUPDATE_QCHECK;
+                  
+               when PHYSICALUPDATE_QCHECK =>
+                  if (subqCache_rdTag(29 downto 27) = std_logic_vector(subqCacheEpoch) and subqCache_rdTag(26) = '1' and
+                      unsigned(subqCache_rdTag(23 downto 0)) = to_unsigned(physicalLBA, 24)) then
+                     physicalUpdateState <= PHYSICALUPDATE_IDLE;
+                     if (subqCache_rdTag(25) = '1') then
+                        for i in 0 to 11 loop
+                           subdata(i) <= subqCache_rdData(i * 8 + 7 downto i * 8);
+                        end loop;
+                     end if;
+                     -- else: bad CRC / ADR 2/3 on the disc -> real controller keeps the previous position
+                  else
+                     -- not cached: synthesize now (as upstream) and ask HPS for the real one for later GetLocP
+                     physicalUpdateState     <= PHYSICALUPDATE_READSUBCHANNEL;
+                     triggerUpdateSubchannel <= '1';
+                     subqReqPhysSeq          <= subqReqPhysSeq + 1;
+                     subq_req_phys_tag       <= std_logic_vector(to_unsigned(physicalLBA, 24));
                   end if;
             
                when PHYSICALUPDATE_READSUBCHANNEL =>
@@ -2443,7 +2610,7 @@ begin
    ss_out(19)              <= header;
    ss_out(20)              <= subheader;
    ss_out(6)(19 downto 0)  <= std_logic_vector(to_unsigned(lastReadSector, 20));
-   ss_out(11)(19 downto 0) <= std_logic_vector(to_unsigned(positionInIndex, 20));
+   ss_out(11)(19 downto 0) <= std_logic_vector(to_signed(positionInIndex, 20));
    
    ss_out(22)( 7 downto 0) <= XaCurrentFile;
    ss_out(22)(15 downto 8) <= XaCurrentChannel;
@@ -2502,6 +2669,8 @@ begin
          if (reset = '1') then
          
             cd_hps_req           <= '0';
+            subqWait             <= '0';
+            subqLastTag          <= (others => '1');
             
             sectorFetchState     <= SFETCH_IDLE;
             sectorProcessState   <= SPROC_IDLE;
@@ -2606,27 +2775,22 @@ begin
                   cd_hps_lba_sim(31 downto 24) <= '0' & trackNumber;
                   -- synthesis translate_on
                   
-                  readSubchannel <= '1';
-															
-                  if (
-                      (libcryptKey(15) = '1' and ((lastReadSector + 2) = 14105 or (lastReadSector + 2) = 14110)) or
-                      (libcryptKey(14) = '1' and ((lastReadSector + 2) = 14231 or (lastReadSector + 2) = 14236)) or
-                      (libcryptKey(13) = '1' and ((lastReadSector + 2) = 14485 or (lastReadSector + 2) = 14490)) or
-                      (libcryptKey(12) = '1' and ((lastReadSector + 2) = 14579 or (lastReadSector + 2) = 14584)) or
-                      (libcryptKey(11) = '1' and ((lastReadSector + 2) = 14649 or (lastReadSector + 2) = 14654)) or
-                      (libcryptKey(10) = '1' and ((lastReadSector + 2) = 14899 or (lastReadSector + 2) = 14904)) or
-                      (libcryptKey(9)  = '1' and ((lastReadSector + 2) = 15056 or (lastReadSector + 2) = 15061)) or
-                      (libcryptKey(8)  = '1' and ((lastReadSector + 2) = 15130 or (lastReadSector + 2) = 15135)) or
-                      (libcryptKey(7)  = '1' and ((lastReadSector + 2) = 15242 or (lastReadSector + 2) = 15247)) or
-                      (libcryptKey(6)  = '1' and ((lastReadSector + 2) = 15312 or (lastReadSector + 2) = 15317)) or
-                      (libcryptKey(5)  = '1' and ((lastReadSector + 2) = 15378 or (lastReadSector + 2) = 15383)) or
-                      (libcryptKey(4)  = '1' and ((lastReadSector + 2) = 15628 or (lastReadSector + 2) = 15633)) or
-                      (libcryptKey(3)  = '1' and ((lastReadSector + 2) = 15919 or (lastReadSector + 2) = 15924)) or
-                      (libcryptKey(2)  = '1' and ((lastReadSector + 2) = 16031 or (lastReadSector + 2) = 16036)) or
-                      (libcryptKey(1)  = '1' and ((lastReadSector + 2) = 16101 or (lastReadSector + 2) = 16106)) or
-                      (libcryptKey(0)  = '1' and ((lastReadSector + 2) = 16167 or (lastReadSector + 2) = 16172))
-                  ) then
-                      readSubchannel <= '0';
+                  subqWait <= '0';
+                  if (subqExt = '0') then
+                     readSubchannel <= not libcryptHit;
+                  elsif (cd_hps_lba /= std_logic_vector(to_unsigned(lastReadSector, 32))) then
+                     -- real Q: HPS sends the Q of frame lastReadSector+2 right before the sector data
+                     subqWait    <= '1';
+                     subqWaitTag <= to_unsigned(lastReadSector + 2, 24);
+                  elsif (subqLastTag = to_unsigned(lastReadSector + 2, 24) and subqLastStatus(SUBQ_ST_PRESENT) = '1') then
+                     -- sector still buffered in HPS, no new request: reuse the Q that came with it
+                     if (subqLastStatus(SUBQ_ST_CRCOK) = '1' and subqLastData(1 downto 0) = "01") then
+                        for i in 0 to 11 loop
+                           nextSubdata(i) <= subqLastData(i * 8 + 7 downto i * 8);
+                        end loop;
+                     end if;
+                  else
+                     readSubchannel <= not libcryptHit;
                   end if;
                   
                   if (hasCD = '0') then
@@ -2672,6 +2836,10 @@ begin
                      
                      if (fetchCount = 587) then
                         sectorFetchState <= SFETCH_IDLE;
+                        if (subqWait = '1') then -- HPS did not deliver a Q for this sector: synthesize as upstream
+                           subqWait       <= '0';
+                           readSubchannel <= not libcryptHit;
+                        end if;
                      else
                         fetchCount  <= fetchCount + 1;
                         sectorFetchState <= SFETCH_HPSWORD;
@@ -2686,7 +2854,51 @@ begin
             
             -- reset cached sector on CD switch
             if (newCD = '1' and newCD_1 = '0') then
-               cd_hps_lba <= (others => '1');
+               cd_hps_lba     <= (others => '1');
+               subqWait       <= '0';
+               subqLastTag    <= (others => '1');
+               subqCacheEpoch <= subqCacheEpoch + 1;
+            end if;
+            
+            -- real Subchannel Q delivered by HPS (CD_SET)
+            subqCache_wren <= '0';
+            if (subq_set = '1' and subq_set_status(SUBQ_ST_LEADIN) = '1') then -- GetQ reply, consumed by command process
+               getQReplyTag    <= subq_set_tag(15 downto 0);
+               getQReplyStatus <= subq_set_status;
+               getQReplyData   <= subq_set_data(79 downto 0);
+               getQReplyToggle <= not getQReplyToggle;
+            end if;
+            if (subq_set = '1' and subq_set_status(SUBQ_ST_LEADIN) = '0') then
+               subqLastTag    <= unsigned(subq_set_tag);
+               subqLastStatus <= subq_set_status;
+               subqLastData   <= subq_set_data;
+               if (subq_set_status(SUBQ_ST_PRESENT) = '1') then
+                  subqCache_wren      <= '1';
+                  subqCache_wrAddr    <= to_integer(unsigned(subq_set_tag(5 downto 0)));
+                  subqCache_wrData    <= subq_set_data;
+                  subqCache_wrTag(29 downto 27) <= std_logic_vector(subqCacheEpoch);
+                  subqCache_wrTag(26) <= '1'; -- valid
+                  if (subq_set_status(SUBQ_ST_CRCOK) = '1' and subq_set_data(1 downto 0) = "01") then
+                     subqCache_wrTag(25) <= '1'; -- usable position data (crc ok, ADR=1)
+                  else
+                     subqCache_wrTag(25) <= '0'; -- bad crc or ADR 2/3: real controller ignores it
+                  end if;
+                  subqCache_wrTag(24)          <= '1';
+                  subqCache_wrTag(23 downto 0) <= subq_set_tag;
+               end if;
+               if (subqWait = '1' and unsigned(subq_set_tag) = subqWaitTag) then
+                  subqWait <= '0';
+                  if (subq_set_status(SUBQ_ST_PRESENT) = '1') then
+                     if (subq_set_status(SUBQ_ST_CRCOK) = '1' and subq_set_data(1 downto 0) = "01") then
+                        for i in 0 to 11 loop
+                           nextSubdata(i) <= subq_set_data(i * 8 + 7 downto i * 8);
+                        end loop;
+                     end if;
+                     -- else: bad CRC (e.g. LibCrypt) or ADR 2/3 -> keep last valid Q, like the real controller
+                  else
+                     readSubchannel <= not libcryptHit; -- HPS has no Q for this frame: synthesize
+                  end if;
+               end if;
             end if;
             
             case (readSubchannelState) is
@@ -3157,6 +3369,7 @@ begin
                
                if (to_integer(unsigned(trackinfo_addr)) = 3) then
                   libcryptKey <= trackinfo_data(15 downto 0);
+                  subqExt     <= trackinfo_data(19); -- HPS delivers real Subchannel Q
                   region_out  <= trackinfo_data(17 downto 16);
                   resetFromCD <= trackinfo_data(18) and (not LIDopen);
                end if;
@@ -3196,6 +3409,44 @@ begin
       end if;
    end process;
    
+   -- Q cache RAM (1 write port from sector fetch, 1 registered read port for the physical position path)
+   process(clk1x)
+   begin
+      if (rising_edge(clk1x)) then
+         if (subqCache_wren = '1') then
+            subqCacheData(subqCache_wrAddr) <= subqCache_wrData;
+            subqCacheTag(subqCache_wrAddr)  <= subqCache_wrTag;
+         end if;
+         subqCache_rdData <= subqCacheData(subqCache_rdAddr);
+         subqCache_rdTag  <= subqCacheTag(subqCache_rdAddr);
+      end if;
+   end process;
+   
+   subq_req_phys_seq <= std_logic_vector(subqReqPhysSeq);
+   subq_req_getq_seq <= std_logic_vector(subqReqGetqSeq);
+   subq_req_getq     <= getQPoint;
+
+   -- LibCrypt emulation from .sbi mask (upstream behavior, also fallback when no real Q is available)
+   libcryptHit <= '1' when (
+                      (libcryptKey(15) = '1' and ((lastReadSector + 2) = 14105 or (lastReadSector + 2) = 14110)) or
+                      (libcryptKey(14) = '1' and ((lastReadSector + 2) = 14231 or (lastReadSector + 2) = 14236)) or
+                      (libcryptKey(13) = '1' and ((lastReadSector + 2) = 14485 or (lastReadSector + 2) = 14490)) or
+                      (libcryptKey(12) = '1' and ((lastReadSector + 2) = 14579 or (lastReadSector + 2) = 14584)) or
+                      (libcryptKey(11) = '1' and ((lastReadSector + 2) = 14649 or (lastReadSector + 2) = 14654)) or
+                      (libcryptKey(10) = '1' and ((lastReadSector + 2) = 14899 or (lastReadSector + 2) = 14904)) or
+                      (libcryptKey(9)  = '1' and ((lastReadSector + 2) = 15056 or (lastReadSector + 2) = 15061)) or
+                      (libcryptKey(8)  = '1' and ((lastReadSector + 2) = 15130 or (lastReadSector + 2) = 15135)) or
+                      (libcryptKey(7)  = '1' and ((lastReadSector + 2) = 15242 or (lastReadSector + 2) = 15247)) or
+                      (libcryptKey(6)  = '1' and ((lastReadSector + 2) = 15312 or (lastReadSector + 2) = 15317)) or
+                      (libcryptKey(5)  = '1' and ((lastReadSector + 2) = 15378 or (lastReadSector + 2) = 15383)) or
+                      (libcryptKey(4)  = '1' and ((lastReadSector + 2) = 15628 or (lastReadSector + 2) = 15633)) or
+                      (libcryptKey(3)  = '1' and ((lastReadSector + 2) = 15919 or (lastReadSector + 2) = 15924)) or
+                      (libcryptKey(2)  = '1' and ((lastReadSector + 2) = 16031 or (lastReadSector + 2) = 16036)) or
+                      (libcryptKey(1)  = '1' and ((lastReadSector + 2) = 16101 or (lastReadSector + 2) = 16106)) or
+                      (libcryptKey(0)  = '1' and ((lastReadSector + 2) = 16167 or (lastReadSector + 2) = 16172))
+                  
+                  ) else '0';
+
    startLBA   <= to_integer(unsigned(trackInfo_DataOutB(18 downto 0)));
    endLBA     <= to_integer(unsigned(trackInfo_DataOutB(37 downto 19)));
    isAudio    <= trackInfo_DataOutB(54);    

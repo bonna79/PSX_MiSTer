@@ -109,6 +109,15 @@ entity psx_mister is
       trackinfo_addr        : in  std_logic_vector(8 downto 0);
       trackinfo_write       : in  std_logic;
       resetFromCD           : out std_logic;
+      -- real Subchannel Q (hps_ext CD_SET / CD_GET)
+      subq_set              : in  std_logic;
+      subq_set_tag          : in  std_logic_vector(23 downto 0);
+      subq_set_status       : in  std_logic_vector(7 downto 0);
+      subq_set_data         : in  std_logic_vector(95 downto 0);
+      subq_req_phys_seq     : out std_logic_vector(7 downto 0);
+      subq_req_phys_tag     : out std_logic_vector(23 downto 0);
+      subq_req_getq_seq     : out std_logic_vector(7 downto 0);
+      subq_req_getq         : out std_logic_vector(15 downto 0);
       cd_hps_req            : out std_logic := '0';
       cd_hps_lba            : out std_logic_vector(31 downto 0);
       cd_hps_lba_sim        : out std_logic_vector(31 downto 0);
@@ -402,6 +411,14 @@ begin
       trackinfo_addr        => trackinfo_addr, 
       trackinfo_write       => trackinfo_write,
       resetFromCD           => resetFromCD,
+      subq_set              => subq_set,
+      subq_set_tag          => subq_set_tag,
+      subq_set_status       => subq_set_status,
+      subq_set_data         => subq_set_data,
+      subq_req_phys_seq     => subq_req_phys_seq,
+      subq_req_phys_tag     => subq_req_phys_tag,
+      subq_req_getq_seq     => subq_req_getq_seq,
+      subq_req_getq         => subq_req_getq,
       cd_hps_req            => cd_hps_req,  
       cd_hps_lba            => cd_hps_lba,  
       cd_hps_lba_sim        => cd_hps_lba_sim,  
