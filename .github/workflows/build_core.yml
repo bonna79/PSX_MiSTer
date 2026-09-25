@@ -1,0 +1,54 @@
+name: Build PSX core (Quartus 17.0.2)
+
+on:
+  push:
+    branches: [ real-subq ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space for the Quartus image
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Compile with Quartus (inside Docker)
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/build \
+            -w /build \
+            theypsilon/quartus-lite-c5:17.0.2.docker0 \
+            bash -xc '
+              export LD_LIBRARY_PATH="/opt/intelFPGA_lite/quartus/linux64:$LD_LIBRARY_PATH"
+              export PATH="/opt/intelFPGA_lite/quartus/linux64:/opt/intelFPGA_lite/quartus/bin:$PATH"
+              /opt/intelFPGA_lite/quartus/linux64/quartus_sh --flow compile PSX.qpf
+              RC=$?
+              echo "==== QUARTUS EXIT CODE: $RC ===="
+              ls -la output_files || echo "no output_files directory"
+              exit $RC
+            '
+
+      - name: Timing summary (negative slack = timing not met)
+        if: always()
+        run: |
+          sudo chown -R "$(id -u)" output_files || true
+          cat output_files/PSX.sta.summary || true
+          grep -i "Timing requirements not met" output_files/PSX.sta.rpt || echo "no 'Timing requirements not met' message"
+
+      - name: Name the rbf
+        run: cp output_files/PSX.rbf "PSX_realsubq_$(date +%Y%m%d).rbf"
+
+      - name: Upload RBF and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PSX_realsubq
+          path: |
+            PSX_realsubq_*.rbf
+            output_files/*.summary
+            output_files/PSX.sta.rpt
